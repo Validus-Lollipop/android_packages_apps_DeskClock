@@ -16,7 +16,10 @@
 package com.android.deskclock.alarms;
 
 import android.app.AlarmManager;
+import android.app.Notification;
+import android.app.NotificationManager;
 import android.app.PendingIntent;
+import android.content.ActivityNotFoundException;
 import android.content.BroadcastReceiver;
 import android.content.ContentResolver;
 import android.content.Context;
@@ -26,6 +29,7 @@ import android.net.Uri;
 import android.os.PowerManager;
 import android.preference.PreferenceManager;
 import android.widget.Toast;
+import android.telephony.TelephonyManager;
 
 import com.android.deskclock.AlarmAlertWakeLock;
 import com.android.deskclock.AlarmClockFragment;
@@ -116,6 +120,13 @@ public final class AlarmStateManager extends BroadcastReceiver {
 
     // Buffer time in seconds to fire alarm instead of marking it missed.
     public static final int ALARM_FIRE_BUFFER = 15;
+
+    private static boolean sRtcPowerUp = false;
+    private static final String ACTION_POWER_ON_ALERT =
+            "org.codeaurora.poweronalert.action.POWER_ON_ALERT";
+    private static final String ALARM_POWER_OFF_ACTION =
+            "org.codeaurora.poweronalert.action.ALARM_POWER_OFF";
+    private static final String FIRST_ALARM_FLAG = "first_alarm";
 
     public static int getGlobalIntentId(Context context) {
         SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
@@ -493,6 +504,14 @@ public final class AlarmStateManager extends BroadcastReceiver {
 
         // Instance is not valid anymore, so find next alarm that will fire and notify system
         updateNextAlarm(context);
+        if (isPowerOffAlarm(context)) {
+            try {
+                context.startActivity(new Intent(ACTION_POWER_ON_ALERT)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+            } catch (ActivityNotFoundException ex) {
+                // do nothing, the powerOnAlert app couldn't be found.
+            }
+        }
     }
 
     /**
@@ -679,6 +698,9 @@ public final class AlarmStateManager extends BroadcastReceiver {
                 break;
             case AlarmInstance.MISSED_STATE:
                 setMissedState(context, instance);
+                if (isPowerOffAlarm(context)) {
+                    context.sendBroadcast(new Intent(ALARM_POWER_OFF_ACTION));
+                }
                 break;
             case AlarmInstance.DISMISSED_STATE:
                 setDismissState(context, instance);
@@ -729,6 +751,19 @@ public final class AlarmStateManager extends BroadcastReceiver {
                 return;
             }
 
+            // If the phone is busy, keep the alarm snoozing.When the call is ended,
+            // the new coming alarm or the alarm which wakes from sooze,will skip the codes here
+            // and continue show the alarm as normal.
+            if (context.getResources().getBoolean(R.bool.config_delayalarm)) {
+                TelephonyManager mTelephonyManager = (TelephonyManager) context
+                        .getSystemService(Context.TELEPHONY_SERVICE);
+                if ((mTelephonyManager.getCallState() != TelephonyManager.CALL_STATE_IDLE)
+                        && (alarmState == AlarmInstance.FIRED_STATE)) {
+                    snooze(context, intent, instance);
+                    return;
+                }
+            }
+
             if (alarmState >= 0) {
                 setAlarmState(context, instance, alarmState);
             } else {
@@ -745,7 +780,11 @@ public final class AlarmStateManager extends BroadcastReceiver {
             Uri uri = intent.getData();
             AlarmInstance instance = AlarmInstance.getInstance(context.getContentResolver(),
                     AlarmInstance.getId(uri));
-
+            if (instance == null) {
+                // Not a big deal, but it shouldn't happen
+                LogUtils.e("Can not show and dismiss alarm for unknown instance: " + uri);
+                return;
+            }
             long alarmId = instance.mAlarmId == null ? Alarm.INVALID_ID : instance.mAlarmId;
             Intent viewAlarmIntent = Alarm.createIntent(context, DeskClock.class, alarmId);
             viewAlarmIntent.putExtra(DeskClock.SELECT_TAB_INTENT_EXTRA, DeskClock.ALARM_TAB_INDEX);
@@ -757,10 +796,61 @@ public final class AlarmStateManager extends BroadcastReceiver {
     }
 
     /**
+     * Make the alarm snooze based on the snooze interval in settings.
+     * If the phone is not busy in call anymore, this method will not be
+     * called, and the alarm will wake up based on snooze interval.
+     */
+    private void snooze(Context context, Intent intent, AlarmInstance instance) {
+        Uri uri = intent.getData();
+        AlarmInstance newInstance = AlarmInstance.getInstance(context.getContentResolver(),
+                AlarmInstance.getId(uri));
+        if (newInstance == null) {
+            // If AlarmInstance is turn to null,return.
+            return;
+        }
+
+        // Notify the user that the alarm has been snoozed.
+        Intent cancelSnooze = createStateChangeIntent(context, ALARM_MANAGER_TAG, newInstance,
+                AlarmInstance.DISMISSED_STATE);
+        PendingIntent broadcast = PendingIntent.getBroadcast(context, instance.hashCode(),
+                cancelSnooze, 0);
+        String label = newInstance.getLabelOrDefault(context);
+        label = context.getString(R.string.alarm_notify_snooze_label, label);
+        NotificationManager nm = (NotificationManager) context
+                .getSystemService(Context.NOTIFICATION_SERVICE);
+        Notification n = new Notification(R.drawable.stat_notify_alarm, label, 0);
+        n.setLatestEventInfo(context, label,
+                context.getString(R.string.alarm_notify_snooze_text,
+                        AlarmUtils.getFormattedTime(context, instance.getAlarmTime())),
+                broadcast);
+        n.flags |= Notification.FLAG_AUTO_CANCEL | Notification.FLAG_ONGOING_EVENT;
+        nm.notify(instance.hashCode(), n);
+        setAlarmState(context, instance, AlarmInstance.SNOOZE_STATE);
+    }
+
+    /**
      * Creates an intent that can be used to set an AlarmManager alarm to set the next alarm
      * indicators.
      */
     public static Intent createIndicatorIntent(Context context) {
         return new Intent(context, AlarmStateManager.class).setAction(INDICATOR_ACTION);
+    }
+
+    public static void setRtcPowerUp(Context context, boolean isRtcPowerUp) {
+        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
+        prefs.edit().putBoolean(FIRST_ALARM_FLAG, isRtcPowerUp).commit();
+    }
+
+    /**
+     * @return true if the alarm is a power off alarm
+     */
+    public static boolean isPowerOffAlarm(Context context) {
+        boolean isPoAlarm = false;
+        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
+        if (prefs.getBoolean(FIRST_ALARM_FLAG, false)) {
+            isPoAlarm = true;
+            setRtcPowerUp(context,false);
+        }
+        return isPoAlarm;
     }
 }

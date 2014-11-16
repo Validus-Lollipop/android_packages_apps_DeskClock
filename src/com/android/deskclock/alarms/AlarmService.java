@@ -1,4 +1,7 @@
 /*
+ * Copyright (c) 2014, The Linux Foundation. All rights reserved.
+ * Not a Contribution.
+ *
  * Copyright (C) 2013 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,17 +18,21 @@
  */
 package com.android.deskclock.alarms;
 
+import android.app.Profile;
+import android.app.ProfileManager;
 import android.app.Service;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
 import android.os.IBinder;
+import android.provider.Settings;
 import android.telephony.PhoneStateListener;
 import android.telephony.TelephonyManager;
 
 import com.android.deskclock.AlarmAlertWakeLock;
 import com.android.deskclock.LogUtils;
 import com.android.deskclock.provider.AlarmInstance;
+import com.android.deskclock.R;
 
 /**
  * This service is in charge of starting/stoping the alarm. It will bring up and manage the
@@ -86,12 +93,54 @@ public class AlarmService extends Service {
             // we register onCallStateChanged, we get the initial in-call state
             // which kills the alarm. Check against the initial call state so
             // we don't kill the alarm during a call.
-            if (state != TelephonyManager.CALL_STATE_IDLE && state != mInitialCallState) {
+            if (AlarmService.this.getResources().getBoolean(R.bool.config_silent_during_call)
+                    && state != TelephonyManager.CALL_STATE_IDLE) {
                 sendBroadcast(AlarmStateManager.createStateChangeIntent(AlarmService.this,
                         "AlarmService", mCurrentAlarm, AlarmInstance.MISSED_STATE));
+            } else if (state != TelephonyManager.CALL_STATE_IDLE && state != mInitialCallState) {
+                sendBroadcast(AlarmStateManager.createStateChangeIntent(AlarmService.this,
+                        "AlarmService", mCurrentAlarm, AlarmInstance.MISSED_STATE));
+                stopCurrentAlarm();
             }
         }
     };
+
+    private void changeToProfile(final Context context, final AlarmInstance instance) {
+        // The alarm is defined to change the active profile?
+        if (instance.mProfile.equals(ProfileManager.NO_PROFILE)) {
+            LogUtils.v("Alarm doesn't define a profile to change to");
+            return;
+        }
+
+        final ProfileManager profileManager =
+                (ProfileManager) context.getSystemService(Context.PROFILE_SERVICE);
+        boolean isProfilesEnabled = Settings.System.getInt(context.getContentResolver(),
+                Settings.System.SYSTEM_PROFILES_ENABLED, 1) == 1;
+        if (!isProfilesEnabled) {
+            LogUtils.v("Profiles are disabled");
+            return;
+        }
+
+        // Ensure that the profile still exists
+        Profile profile = profileManager.getProfile(instance.mProfile);
+        if (profile == null) {
+            LogUtils.e("The profile \"" + instance.mProfile
+                    + "\" does not exist. Can't change to this profile");
+            return;
+        }
+
+        // Is the current profile different?
+        Profile activeProfile = profileManager.getActiveProfile();
+        if (activeProfile == null || !profile.getUuid().equals(activeProfile.getUuid())) {
+            // Change to profile
+            LogUtils.i("Changing to profile \"" + profile.getName() + "\" (" + profile.getUuid()
+                    + ") requested by alarm \"" + instance.mLabel + "\" (" + instance.mId + ")");
+            profileManager.setActiveProfile(profile.getUuid());
+        } else {
+            LogUtils.v("The profile \"" + profile.getName() + "\" (" + profile.getUuid()
+                    + " is already active. No need to change to");
+        }
+    }
 
     private void startAlarm(AlarmInstance instance) {
         LogUtils.v("AlarmService.start with instance: " + instance.mId);
@@ -107,6 +156,7 @@ public class AlarmService extends Service {
         mTelephonyManager.listen(mPhoneStateListener, PhoneStateListener.LISTEN_CALL_STATE);
         boolean inCall = mInitialCallState != TelephonyManager.CALL_STATE_IDLE;
         AlarmKlaxon.start(this, mCurrentAlarm, inCall);
+        changeToProfile(this, mCurrentAlarm);
         sendBroadcast(new Intent(ALARM_ALERT_ACTION));
     }
 
